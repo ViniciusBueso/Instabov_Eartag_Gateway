@@ -13,6 +13,7 @@ volatile eartag_type eartag = {
 volatile char adv_data[100] = {0};
 
 BT_SCAN_CB_INIT(scan_cb, scan_filter_match_cb, device_found_cb, NULL, NULL);
+K_SEM_DEFINE(eartag_pkt_rcvd, 0, 1);
 
 
 void init_scan_module(void){
@@ -42,13 +43,10 @@ void scan_filter_match_cb(struct bt_scan_device_info *device_info, struct bt_sca
 void device_found_cb(struct bt_scan_device_info *device_info, bool connectable){
     eartag.rssi = device_info->recv_info->rssi;
     bt_addr_le_to_str(device_info->recv_info->addr, eartag.addr_str, sizeof(eartag.addr_str));
+    eartag.addr_str[17]=0x00;
     eartag.rx_counter = eartag.rx_counter+1;
     bt_data_parse(device_info->adv_data, data_parser_cb, NULL);
-    printk("ADDR: %s ||  ", eartag.addr_str);
-    printk("STEPS: %d ||  ", eartag.steps);
-    printk("BAT: %d ||  ", eartag.bat);
-    printk("RSSI: %d\r\n", eartag.rssi);
-
+    k_sem_give(&eartag_pkt_rcvd);       
 }
 
 bool data_parser_cb(struct bt_data *data, void *user_data){

@@ -21,4 +21,6 @@ typedef struct{
 
 extern volatile eartag_type eartag;
 extern volatile char adv_data[100];
+extern struct k_sem eartag_pkt_rcvd;
+
 #endif
