@@ -1,6 +1,8 @@
 #include <zephyr/kernel.h>
 #include "ble/ble_scan.h"
 #include "peripherals/my_gpio.h"
+#include "app.h"
+#include "peripherals/my_uart.h"
 
 int err;
 
@@ -8,6 +10,11 @@ int main(void)
 {
 	//Configure buttons and LEDs
 	configure_my_gpio();
+
+	err = my_uart_initialize();
+	if(err){
+		sprintf(debug_str, "UART Error: %d", err);
+	}
 
 	//Initialize BLE stack
 	bt_enable(NULL);
@@ -21,8 +28,19 @@ int main(void)
 		printk("err=%d\r\n", err);
 	}
 	printk("oi\r\n");
+
+	//Enable the reception of standard packets
+	err = uart_rx_enable(my_uart, std_uart_packet_rx.frame, sizeof(std_uart_packet_rx.frame), SYS_FOREVER_US);
+
+	if(err){
+		sprintf(debug_str, "UART Error: %d", err);
+	}
+
 	while(1){
-		k_sleep(K_MSEC(100));
+		//k_sem_take(&run_cmd_res_handler, K_FOREVER);
+		cmd_res_handler();
+		debug_print_table();
+		k_sleep(K_MSEC(10));
 	}
     return 0;
 }

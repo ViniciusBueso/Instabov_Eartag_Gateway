@@ -7,4 +7,6 @@ target_sources(app PRIVATE
         src/main.c
         src/ble/ble_scan.c
         src/peripherals/my_gpio.c
+        src/peripherals/my_uart.c
+        src/app.c
 )
