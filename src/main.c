@@ -37,10 +37,8 @@ int main(void)
 	}
 
 	while(1){
-		//k_sem_take(&run_cmd_res_handler, K_FOREVER);
-		cmd_res_handler();
+		app_state_machine();
 		debug_print_table();
-		k_sleep(K_MSEC(10));
 	}
     return 0;
 }

@@ -48,22 +48,21 @@ int my_uart_initialize(void){
 void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data){
     switch(evt->type){
         case UART_TX_DONE:
-            gpio_pin_toggle_dt(&led2);
+            
         break;
 
         case UART_RX_RDY:
-            gpio_pin_toggle_dt(&led2);
             size_t rcv_len = evt->data.rx.len;
             size_t rcv_offset = evt->data.rx.offset;
             size_t total_rcv_len = rcv_len+rcv_offset;
-            strcpy(debug_str, "Packet Received");
             if(total_rcv_len==sizeof(std_uart_packet_rx.frame)){
                 k_timer_stop(&uart_timeout);
-                atomic_set_bit(&evt_flags, evt_uart_pkt_rcvd);
+                // Notify reception of a standard packet
+                k_event_post(&app_evt, EVT_STD_PKT_RCVD);
             }else if(rcv_offset==0){
                 k_timer_start(&uart_timeout, K_SECONDS(3), K_NO_WAIT);
             }
-            gpio_pin_toggle_dt(&led3);
+            
         break;
 
         case UART_RX_DISABLED:

@@ -7,6 +7,7 @@
 #include "peripherals/my_gpio.h"
 #include <string.h>
 #include <time.h>
+#include <zephyr/sys/crc.h>
 
 //Debug GUI
 #define ERASE_DISPLAY printk("\033[H\033[0J")
@@ -19,10 +20,34 @@
 #define SET_COLOR_DISPLAY(r,g,b) printk("\033[38;2;%d;%d;%dm",r,g,b)
 #define SET_BG_COLOR_DISPLAY(r,g,b) printk("\033[48;2;%d;%d;%dm",r,g,b)
 
-extern volatile char debug_str[20];
+extern volatile char debug_str[100];
 extern volatile bool just_once_debug;
 
 #define EARTAG_TABLE_SIZE 1000
+
+//Application State Machine states definition
+typedef enum{
+    fetching_procedures,
+    time_sync,
+    table_xfer_prepare,
+    table_xfer_send_table,
+    table_xfer_wait_ack,
+}states_type;
+
+extern volatile states_type state;
+
+// Queue used by ISRs to submit procedure requests for processing by the application state machine
+extern struct k_msgq procedure_queue;
+
+// Procedures enumeration
+typedef enum{
+    none,
+    time_sync_proc,
+    table_xfer_proc,
+} procedures_t;
+
+// Variable used to post procedure requests
+extern volatile procedures_t procedure_request;
 
 // Structure holding all data related to a single received advertising packet
 typedef struct{
@@ -48,15 +73,13 @@ typedef union{
 //flags inside delta_flag
 #define TIME_FLAG       (1u << 0)
 #define ID_FLAG         (1u << 1)
-#define BAT_FLAG        (1u << 2)
-#define STEP_FLAG       (1u << 3)
+#define STEP_FLAG       (1u << 2)
+#define BAT_FLAG        (1u << 3)
 #define RSSI_FLAG       (1u << 4)
 
 
 // Structure representing a single entry in the eartag table
 typedef struct{
-    uint16_t idx;
-    uint8_t delta_flag;
     uint32_t unix_time;
     uint8_t eartag_id[6];
     custom_data_type bat_step;
@@ -65,6 +88,15 @@ typedef struct{
 
 // Eartag table storage
 extern volatile table_entry_type eartag_table[EARTAG_TABLE_SIZE];
+
+// Snapshot of the eartag table at the time of the last transmission
+extern volatile table_entry_type last_tx_eartag_table[EARTAG_TABLE_SIZE];
+
+// Index of the first available entry in the eartag table
+extern volatile uint16_t current_idx;
+
+// Index of the first available entry in the eartag table at the time of the last transmission
+extern volatile uint16_t last_tx_current_idx;
 
 // Union for accessing the individual bytes of a uint32_t variable
 typedef union{
@@ -83,22 +115,31 @@ typedef union{
     }__attribute__((packed)) field;
 }std_uart_pkt_type;
 
-// Extended UART packet structure
+// Structure used for transmitting the eartag table
 typedef union{
-    uint8_t frame[EARTAG_TABLE_SIZE*sizeof(table_entry_type)+3];
+    uint8_t frame[(EARTAG_TABLE_SIZE*14)+16];
     struct{
         uint8_t opcode;
-        uint16_t pkt_length;
-        uint8_t payload[EARTAG_TABLE_SIZE*sizeof(table_entry_type)];
+        my_uint32_t crc32;
+        uint16_t n_of_entries;
+        my_uint32_t base_timestamp;
+        my_uint32_t base_step_counter;
+        uint8_t delta_step_counter_len;
+        uint8_t delta_payload[EARTAG_TABLE_SIZE*14];
     }__attribute__((packed)) field;
-}ext_uart_pkt_type;
+}delta_frame_t;
+
+// Size of the table to be transmitted, in bytes
+extern volatile uint32_t delta_table_pkt_len;
+
 
 //UART opcodes
 #define TIME_SYNC_CMD 0x09
 #define TABLE_REQ_CMD 0x0A
-#define OK_RES 0x0B
-#define NOK_RES 0x0C
-#define TABLE_RES 0x0D
+#define TABLE_LEN_RES 0x0B
+#define OK_RES 0x0C
+#define NOK_RES 0x0D
+#define TABLE_RES 0x0E
 
 // Standard TX UART packet instance
 extern volatile std_uart_pkt_type std_uart_packet_tx;
@@ -106,31 +147,23 @@ extern volatile std_uart_pkt_type std_uart_packet_tx;
 // Standard RX UART packet instance
 extern volatile std_uart_pkt_type std_uart_packet_rx;
 
-// Extended UART packet instance (used for transferring the eartag table)
-extern volatile ext_uart_pkt_type ext_uart_packet;
+// Structure used for transmitting the eartag table
+extern volatile delta_frame_t delta_table_packet;
 
 
+// Bit positions of the events.
+#define EVT_TIME_SYNC       (1u << 0)
+#define EVT_OK_RCVD         (1u << 1)
+#define EVT_NOK_RCVD        (1u << 2)
+#define EVT_STD_PKT_RCVD    (1u << 3)
+#define EVT_DELTA_PKT_RCVD  (1u << 4)
+#define EVT_UART_TIMEOUT    (1u << 5)
 
-// Atomic flags used for synchronization and event signaling
-// between cmd_res_handler and interrupt service routines (ISRs).
-extern volatile atomic_t evt_flags;
-
-// Bit positions of the event flags stored in evt_flags.
-enum{
-    evt_time_sync_req = 0,
-    evt_time_sync_ongoing,
-    evt_table_transfer_req,
-    evt_table_transfer_ongoing,
-    evt_uart_pkt_rcvd,
-    evt_eartag_pkt_rcvd,
-    evt_uart_timeout,
-};
+// Event object used for inter-thread and ISR signaling
+extern struct k_event app_evt;
 
 // Semaphore that triggers the execution of cmd_res_handler()
 extern struct k_sem run_cmd_res_handler;
-
-// Index of the first available entry in the eartag table
-extern volatile uint16_t current_idx;
 
 // Current Unix timestamp (seconds since epoch)
 extern volatile uint32_t current_unix_time;
@@ -150,6 +183,9 @@ extern volatile uint32_t net_sync_counter;
 // Message queue shared between the scan ISR and eartag_table_handler(): 
 // the ISR enqueues received eartags, and the handler inserts them into the eartag table
 extern struct k_msgq eartag_msg_queue;
+
+// This flag prevents new entries from being added to the eartag table during the table transfer procedure
+extern volatile atomic_t table_tx_ongoing;
 
 // Unix timer resolution, in milliseconds
 #define UNIX_TIMER_RESOLUTION_MS 5000
@@ -173,12 +209,15 @@ void macStr_to_macHex(char *mac_str, uint8_t *mac_hex);
 // Returns the corresponding index if found, or -1 if it does not exist.
 int exists_in_table(uint8_t *mac_hex);
 
-// Main loop for handling commands and responses
-int cmd_res_handler(void);
+// Compare the current eartag table with the last transmitted one and format the provided delta frame accordingly
+// Returns 0 on success, or -1 on failure
+int format_delta_packet(delta_frame_t *df);
+
+// Application state machine
+void app_state_machine(void);
 
 // Function responsible for printing the current table to the terminal
 void debug_print_table(void);
-
 
 // Formats a number into a string of fixed length (char_size), centering the number
 // and padding the remaining characters as needed.

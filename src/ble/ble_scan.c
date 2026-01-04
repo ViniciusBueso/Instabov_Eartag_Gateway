@@ -36,8 +36,11 @@ void device_found_cb(struct bt_scan_device_info *device_info, bool connectable){
     received_eartag.rssi = device_info->recv_info->rssi;
     bt_addr_le_to_str(device_info->recv_info->addr, received_eartag.addr_str, sizeof(received_eartag.addr_str));
     bt_data_parse(device_info->adv_data, data_parser_cb, &received_eartag);
-    atomic_set_bit(&evt_flags, evt_eartag_pkt_rcvd);
-    k_sem_give(&run_cmd_res_handler);
+    
+    // Do not add new entries while the eartag table is being transferred
+    if(atomic_test_bit(&table_tx_ongoing, 0)){
+        return;
+    }
 
     /* send data to consumers */
     if (k_msgq_put(&eartag_msg_queue, &received_eartag, K_NO_WAIT) != 0) {
