@@ -37,8 +37,8 @@ void device_found_cb(struct bt_scan_device_info *device_info, bool connectable){
     bt_addr_le_to_str(device_info->recv_info->addr, received_eartag.addr_str, sizeof(received_eartag.addr_str));
     bt_data_parse(device_info->adv_data, data_parser_cb, &received_eartag);
     
-    // Do not add new entries while the eartag table is being transferred
-    if(atomic_test_bit(&table_tx_ongoing, 0)){
+    // Do not add new entries
+    if(atomic_test_bit(&table_freeze, 0)){
         return;
     }
 

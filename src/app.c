@@ -17,6 +17,13 @@ K_MSGQ_DEFINE(procedure_queue, sizeof(procedure_request), 16, 4);
 // Timer used to restart the UART in case of a timeout
 K_TIMER_DEFINE(uart_timeout, uart_timeout_cb, NULL);
 
+// Timer used to detect a procedure stall
+K_TIMER_DEFINE(procedure_timeout, procedure_timeout_cb, NULL);
+
+// Timer used to periodically perform housekeeping on the eartag table,
+// removing entries that have not been updated for 'TOO_OLD_EARTAG_HOURS' hours or more
+K_TIMER_DEFINE(table_housekeeping, table_housekeeping_cb, NULL);
+
 // Eartag table storage
 volatile table_entry_type eartag_table[EARTAG_TABLE_SIZE] = {0};
 
@@ -70,8 +77,11 @@ volatile eartag_type eartag = {
                     .rssi=0,
                     .steps = 0};
 
-// This flag prevents new entries from being added to the eartag table during the table transfer procedure
-volatile atomic_t table_tx_ongoing = ATOMIC_INIT(0);
+// This flag prevents new entries from being added to the eartag table during critical operations
+volatile atomic_t table_freeze = ATOMIC_INIT(0);
+
+// Semaphore used by add_to_table() to notify that an entry has been removed from the table
+K_SEM_DEFINE(entry_removed_sem, 0, 1);
 
 #define THREAD_STACK_SIZE 2048
 #define THREAD_PRIORITY 7
@@ -85,6 +95,7 @@ void eartag_table_handler(void *arg1, void *arg2, void *arg3);
 int add_to_table(eartag_type *ear_tag){
     int err;
     uint8_t entry_id[6] = {0};
+    uint8_t compare_id[6] = {0};
     int found_index = 0;
     uint64_t local_time = 0;
     time_t brazil_time;
@@ -99,6 +110,23 @@ int add_to_table(eartag_type *ear_tag){
 
     // Converts a MAC address string to a hexadecimal byte array
     macStr_to_macHex(ear_tag->addr_str, entry_id);
+
+    // Check if the entry ID is a NULL MAC address.
+    // If so, delete the entry specified by the Steps field.
+    if(memcmp(entry_id, compare_id, 6)==0){
+        uint16_t del_idx = ear_tag->steps;
+        if(del_idx>=current_idx){
+            return -1;
+        }
+        for (uint16_t idx_ptr = del_idx; idx_ptr < (current_idx - 1); idx_ptr++) {
+            eartag_table[idx_ptr] = eartag_table[idx_ptr + 1];
+        }
+        current_idx--;
+        // Clear the now-unused last entry
+        memset(&eartag_table[current_idx], 0x00, sizeof(table_entry_type));
+        k_sem_give(&entry_removed_sem);
+        return 0;
+    }
 
     // Verifies if the resulting ID already exists in the table.
     found_index = exists_in_table(entry_id);
@@ -166,6 +194,7 @@ void macStr_to_macHex(char *mac_str, uint8_t *mac_hex){
 }
 
 
+
 // Checks whether the provided MAC address already exists in the eartag table.
 // Returns the corresponding index if found, or -1 if it does not exist.
 int exists_in_table(uint8_t *mac_hex){
@@ -185,13 +214,28 @@ int exists_in_table(uint8_t *mac_hex){
     return -1;
 }
 
-// Timer callback function
+// UART timeout callback function
 void uart_timeout_cb(struct k_timer *timer_id){
     int err;
     uart_rx_disable(my_uart);
     k_event_post(&app_evt, EVT_UART_TIMEOUT);
 }
 
+// Procedure timeout callback function
+void procedure_timeout_cb(struct k_timer *timer_id){
+    strcpy(debug_str, "Procedure timeout");
+    uart_rx_disable(my_uart);
+    state = fetching_procedures;
+    uart_rx_enable(my_uart, std_uart_packet_rx.frame, sizeof(std_uart_packet_rx.frame), 1000);
+}
+
+// Table housekeeping callback function
+void table_housekeeping_cb(struct k_timer *timer_id){
+    procedure_request = table_housekeeping_proc;
+    if (k_msgq_put(&procedure_queue, &procedure_request, K_NO_WAIT) != 0) {
+        //drop newest packet
+    }
+}
 
 
 // Application state machine
@@ -212,6 +256,10 @@ void app_state_machine(void){
                         state = table_xfer_prepare;
                     break;
 
+                    case table_housekeeping_proc:
+                        state = table_housekeeping_start;
+                    break;
+
                     default:
                     break;
                 }
@@ -229,13 +277,14 @@ void app_state_machine(void){
             std_uart_packet_tx.field.opcode = OK_RES;
             std_uart_packet_tx.field.payload.bytes.byte[0] = TIME_SYNC_CMD;
             uart_tx(my_uart, std_uart_packet_tx.frame, sizeof(std_uart_packet_tx.frame), SYS_FOREVER_US);
+            k_timer_stop(&procedure_timeout);
             state = fetching_procedures;         
         break;
 
         case table_xfer_prepare:
 
             // Prevents new entries from being added to the eartag table during the table transfer procedure 
-            atomic_set_bit(&table_tx_ongoing, 0);
+            atomic_set_bit(&table_freeze, 0);
 
             // Prepare and format the delta packet for transmission
             ret = format_delta_packet(&delta_table_packet);
@@ -252,7 +301,7 @@ void app_state_machine(void){
                 std_uart_packet_tx.field.opcode = NOK_RES;
                 std_uart_packet_tx.field.payload.bytes.byte[0] = TABLE_REQ_CMD;
                 uart_tx(my_uart, std_uart_packet_tx.frame, sizeof(std_uart_packet_tx.frame), SYS_FOREVER_US);
-                atomic_clear_bit(&table_tx_ongoing, 0);
+                atomic_clear_bit(&table_freeze, 0);
                 state = fetching_procedures;
                 strcpy(debug_str, "Delta Pkt generation failed");
             }
@@ -276,7 +325,7 @@ void app_state_machine(void){
                 }
 
             }else if(rcvd_events & EVT_NOK_RCVD){
-                atomic_clear_bit(&table_tx_ongoing, 0);
+                atomic_clear_bit(&table_freeze, 0);
                 state = fetching_procedures;
             }
 
@@ -296,20 +345,50 @@ void app_state_machine(void){
                     // Store a snapshot of the transmitted table into last_tx_eartag_table
                     memcpy(last_tx_eartag_table, eartag_table, sizeof(eartag_table));
 
-                    atomic_clear_bit(&table_tx_ongoing, 0);
-
+                    atomic_clear_bit(&table_freeze, 0);
+                    k_timer_stop(&procedure_timeout);
                     state = fetching_procedures;
                 }
 
             }else if(rcvd_events & EVT_NOK_RCVD){
                 strcpy(debug_str, "Table TX failed");
 
-                atomic_clear_bit(&table_tx_ongoing, 0);
-                
+                atomic_clear_bit(&table_freeze, 0);
+                k_timer_stop(&procedure_timeout);
                 state = fetching_procedures;
             }    
         break;
+        
+        case table_housekeeping_start:
+            uint32_t too_old_eartag_secs = TOO_OLD_EARTAG_HOURS*60*60;
+            eartag_type delete_eartag = {0};
 
+            // Prevents new entries from being added to the eartag table during the table housekeeping procedure
+            atomic_set_bit(&table_freeze, 0);
+
+            //Get current unix time
+            clock_gettime(CLOCK_REALTIME, &current_ts);
+            uint64_t local_time = current_ts.tv_sec;
+
+            //Remove entries that have not been updated for 'TOO_OLD_EARTAG_HOURS' hours or more
+            for(uint16_t i=0; i<current_idx; i++){
+                uint32_t eartag_ts = eartag_table[i].unix_time;
+                if(eartag_ts<=local_time){
+                    uint32_t delta_ts = ((uint32_t)local_time) - eartag_ts;
+                    if(delta_ts>=too_old_eartag_secs){
+                        strcpy(delete_eartag.addr_str, "00:00:00:00:00:00");
+                        delete_eartag.steps = i;
+                        /* send data to consumers */
+                        if (k_msgq_put(&eartag_msg_queue, &delete_eartag, K_NO_WAIT) != 0) {
+                            //drop newest packet
+                        }
+                        k_sem_take(&entry_removed_sem, K_FOREVER);   
+                    }
+                }
+            }
+            atomic_clear_bit(&table_freeze, 0);
+            state = fetching_procedures;
+        break;
 
     }
 }
@@ -354,6 +433,7 @@ int cmd_res_handler(void *arg1, void *arg2, void *arg3){
             var_opcode = std_uart_packet_rx.field.opcode;
             switch(var_opcode){
                 case TIME_SYNC_CMD:
+                    k_timer_start(&procedure_timeout, K_SECONDS(5), K_NO_WAIT);
                     procedure_request = time_sync_proc;
                     if (k_msgq_put(&procedure_queue, &procedure_request, K_NO_WAIT) != 0) {
                         //drop newest packet
@@ -366,6 +446,7 @@ int cmd_res_handler(void *arg1, void *arg2, void *arg3){
                 break;
 
                 case TABLE_REQ_CMD:
+                    k_timer_start(&procedure_timeout, K_SECONDS(10), K_NO_WAIT);
                     strcpy(debug_str, "Table Req CMD rcvd");
                     procedure_request = table_xfer_proc;
                     if (k_msgq_put(&procedure_queue, &procedure_request, K_NO_WAIT) != 0) {

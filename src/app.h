@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 #include <zephyr/sys/crc.h>
+#include "app_config.h"
 
 //Debug GUI
 #define ERASE_DISPLAY printk("\033[H\033[0J")
@@ -32,6 +33,7 @@ typedef enum{
     table_xfer_prepare,
     table_xfer_send_table,
     table_xfer_wait_ack,
+    table_housekeeping_start,
 }states_type;
 
 extern volatile states_type state;
@@ -44,6 +46,7 @@ typedef enum{
     none,
     time_sync_proc,
     table_xfer_proc,
+    table_housekeeping_proc,
 } procedures_t;
 
 // Variable used to post procedure requests
@@ -184,8 +187,11 @@ extern volatile uint32_t net_sync_counter;
 // the ISR enqueues received eartags, and the handler inserts them into the eartag table
 extern struct k_msgq eartag_msg_queue;
 
-// This flag prevents new entries from being added to the eartag table during the table transfer procedure
-extern volatile atomic_t table_tx_ongoing;
+// This flag prevents new entries from being added to the eartag table during critical operations
+extern volatile atomic_t table_freeze;
+
+// Semaphore used by add_to_table() to notify that an entry has been removed from the table
+extern struct k_sem entry_removed_sem;
 
 // Unix timer resolution, in milliseconds
 #define UNIX_TIMER_RESOLUTION_MS 5000
@@ -193,8 +199,14 @@ extern volatile atomic_t table_tx_ongoing;
 // Interval between consecutive network time synchronization operations, in milliseconds
 #define NET_TIME_SYNC_PERIOD_MS 120000
 
-// Timer callback function
+// UART timeout callback function
 void uart_timeout_cb(struct k_timer *timer_id);
+
+// Procedure timeout callback function
+void procedure_timeout_cb(struct k_timer *timer_id);
+
+// Table housekeeping callback function
+void table_housekeeping_cb(struct k_timer *timer_id);
 
 // Adds an entry to the eartag table, or updates it if the same ID already exists
 int add_to_table(eartag_type *ear_tag);
