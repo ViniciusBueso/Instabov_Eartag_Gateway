@@ -72,7 +72,7 @@ K_MSGQ_DEFINE(eartag_msg_queue, sizeof(eartag_type), 16, 4);
 
 // Structure holding all data related to a single received advertising packet
 volatile eartag_type eartag = {
-                    .addr_str={0},
+                    .mac_addr={0},
                     .bat=0,
                     .rssi=0,
                     .steps = 0};
@@ -105,11 +105,10 @@ int add_to_table(eartag_type *ear_tag){
     local_time = current_ts.tv_sec;
     current_unix_time = (uint32_t)current_ts.tv_sec;
     brazil_time = current_ts.tv_sec - 10800;
-    //gmtime_r(&current_ts.tv_sec, &utc_date);
     gmtime_r(&brazil_time, &utc_date);
 
-    // Converts a MAC address string to a hexadecimal byte array
-    macStr_to_macHex(ear_tag->addr_str, entry_id);
+    // Copy the MAC address from the eartag structure into entry_id for easier handling
+    memcpy(entry_id, ear_tag->mac_addr, 6);
 
     // Check if the entry ID is a NULL MAC address.
     // If so, delete the entry specified by the Steps field.
@@ -286,8 +285,20 @@ void app_state_machine(void){
             // Prevents new entries from being added to the eartag table during the table transfer procedure 
             atomic_set_bit(&table_freeze, 0);
 
+            // Check whether the received hash matches the hash calculated from the previously transmitted table.
+            // If they match, the LTE SiP and BLE SoC are synchronized and only changed fields are sent.
+            // If they do not match, all fields must be sent.
+            uint32_t rcvd_hash = std_uart_packet_rx.field.payload.value;
+            uint32_t calc_hash = sys_hash32_murmur3(last_tx_eartag_table, sizeof(last_tx_eartag_table));
+            bool all_or_delta;
+            if(rcvd_hash==calc_hash){
+                all_or_delta = false;
+            }else{
+                all_or_delta = true;
+            }
+
             // Prepare and format the delta packet for transmission
-            ret = format_delta_packet(&delta_table_packet);
+            ret = format_delta_packet(&delta_table_packet, all_or_delta);
 
             // Send the delta table length packet on success, or an NOK packet otherwise
             if(ret>0){
@@ -376,7 +387,7 @@ void app_state_machine(void){
                 if(eartag_ts<=local_time){
                     uint32_t delta_ts = ((uint32_t)local_time) - eartag_ts;
                     if(delta_ts>=too_old_eartag_secs){
-                        strcpy(delete_eartag.addr_str, "00:00:00:00:00:00");
+                        memset(delete_eartag.mac_addr, 0x00, 6);
                         delete_eartag.steps = i;
                         /* send data to consumers */
                         if (k_msgq_put(&eartag_msg_queue, &delete_eartag, K_NO_WAIT) != 0) {
@@ -486,8 +497,9 @@ K_THREAD_DEFINE(cmd_res_handler_tid, THREAD_STACK_SIZE,
                 THREAD_PRIORITY, 0, 0);
 
 // Compare the current eartag table with the last transmitted one and format the provided delta frame accordingly
+// If send_all is set, all fields are transmitted; otherwise, only fields that changed since the last transmission are included
 // Returns the delta frame length on success, or -1 on failure
-int format_delta_packet(delta_frame_t *df){
+int format_delta_packet(delta_frame_t *df, bool send_all){
     uint32_t base_ts = UINT32_MAX;
     uint32_t base_stp = UINT32_MAX;
     uint8_t step_len = 0;
@@ -509,6 +521,9 @@ int format_delta_packet(delta_frame_t *df){
     // determine the maximum step-counter delta to size the delta field, and set up the delta flags for each entry
     for(uint16_t i=0; i<current_idx; i++){  
         
+        // Clear delta flag field
+        df->field.delta_payload[i] = 0;
+
         //Update minimum timespamp
         if((eartag_table[i].unix_time) < base_ts){
             base_ts = eartag_table[i].unix_time;
@@ -522,6 +537,12 @@ int format_delta_packet(delta_frame_t *df){
         //Update the maximum step counter
         if(max_step < eartag_table[i].bat_step.field.step){
             max_step = eartag_table[i].bat_step.field.step;
+        }
+
+        //Include all fields if send_all is set
+        if(send_all){
+            df->field.delta_payload[i] = BAT_FLAG | STEP_FLAG | RSSI_FLAG | TIME_FLAG | ID_FLAG;
+            continue;
         }
 
         //Update delta bat flag

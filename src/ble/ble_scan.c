@@ -26,31 +26,41 @@ void init_scan_module(void){
 
 
 void scan_filter_match_cb(struct bt_scan_device_info *device_info, struct bt_scan_filter_match *filter_match, bool connectable){
-    eartag.rssi = device_info->recv_info->rssi;
-    bt_addr_le_to_str(device_info->recv_info->addr, eartag.addr_str, sizeof(eartag.addr_str));
-    bt_data_parse(device_info->adv_data, data_parser_cb, NULL); 
+    
 }
 
 void device_found_cb(struct bt_scan_device_info *device_info, bool connectable){
     eartag_type received_eartag;
-    received_eartag.rssi = device_info->recv_info->rssi;
-    bt_addr_le_to_str(device_info->recv_info->addr, received_eartag.addr_str, sizeof(received_eartag.addr_str));
-    bt_data_parse(device_info->adv_data, data_parser_cb, &received_eartag);
+    static uint8_t compare_id[6] = {0};
     
     // Do not add new entries
     if(atomic_test_bit(&table_freeze, 0)){
         return;
     }
 
+    //Store the measured RSSI
+    received_eartag.rssi = device_info->recv_info->rssi;
+    
+    //Store the eartag address in big endian format
+    received_eartag.mac_addr[0] = device_info->recv_info->addr->a.val[5];
+    received_eartag.mac_addr[1] = device_info->recv_info->addr->a.val[4];
+    received_eartag.mac_addr[2] = device_info->recv_info->addr->a.val[3];
+    received_eartag.mac_addr[3] = device_info->recv_info->addr->a.val[2];
+    received_eartag.mac_addr[4] = device_info->recv_info->addr->a.val[1];
+    received_eartag.mac_addr[5] = device_info->recv_info->addr->a.val[0];
+
+    // Do not add entries with a null MAC address, since such entries are interpreted as delete requests
+    if(memcmp(received_eartag.mac_addr, compare_id, 6)==0){
+        return;
+    }
+
+    // Parse the payload, which contains the step counter and battery data
+    bt_data_parse(device_info->adv_data, data_parser_cb, &received_eartag);
+ 
     /* send data to consumers */
     if (k_msgq_put(&eartag_msg_queue, &received_eartag, K_NO_WAIT) != 0) {
         //drop newest packet
     }
-
-    //printk("ADDR: %s ||  ", eartag.addr_str);
-    //printk("STEPS: %d ||  ", eartag.steps);
-    //printk("BAT: %d ||  ", eartag.bat);
-    //printk("RSSI: %d\r\n", eartag.rssi);
 
 }
 

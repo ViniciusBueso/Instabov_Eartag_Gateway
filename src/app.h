@@ -9,6 +9,7 @@
 #include <time.h>
 #include <zephyr/sys/crc.h>
 #include "app_config.h"
+#include <zephyr/sys/hash_function.h>
 
 //Debug GUI
 #define ERASE_DISPLAY printk("\033[H\033[0J")
@@ -55,7 +56,7 @@ extern volatile procedures_t procedure_request;
 // Structure holding all data related to a single received advertising packet
 typedef struct{
     int8_t rssi;
-    char addr_str[BT_ADDR_LE_STR_LEN];
+    uint8_t mac_addr[6];
     uint8_t bat;
     uint32_t steps;
 }eartag_type;
@@ -222,8 +223,9 @@ void macStr_to_macHex(char *mac_str, uint8_t *mac_hex);
 int exists_in_table(uint8_t *mac_hex);
 
 // Compare the current eartag table with the last transmitted one and format the provided delta frame accordingly
+// If send_all is set, all fields are transmitted; otherwise, only fields that changed since the last transmission are included
 // Returns 0 on success, or -1 on failure
-int format_delta_packet(delta_frame_t *df);
+int format_delta_packet(delta_frame_t *df, bool send_all);
 
 // Application state machine
 void app_state_machine(void);
