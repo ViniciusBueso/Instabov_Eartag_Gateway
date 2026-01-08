@@ -12,10 +12,16 @@ int my_uart_initialize(void);
 
 void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data);
 
+// Dual-buffer structure used for continuous data reception
+typedef struct{
+    uint8_t a[150];
+    uint8_t b[150];
+    bool a_busy;
+    bool b_busy;
+}dual_buf_t;
 
-//buffers
-extern volatile char tx_buf[50];
-extern volatile char rx_buf[50];
+// Dual-buffer instance for RX reception
+extern volatile dual_buf_t rx_buf;
 
 //Define the semaphore for tx and rx signaling
 extern struct k_sem tx_complete;

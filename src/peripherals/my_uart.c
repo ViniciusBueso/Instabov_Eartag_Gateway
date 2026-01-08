@@ -14,8 +14,6 @@ volatile struct uart_config uart_cfg = {
         .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
 };
 
-volatile char tx_buf[50] = {0};
-volatile char rx_buf[50] = {0};
 
 //Define the semaphore for tx and rx signaling
 K_SEM_DEFINE(tx_complete, 0, 1);
@@ -23,6 +21,9 @@ K_SEM_DEFINE(rx_complete, 0, 1);
 
 volatile size_t uart_pkt_len = 1;
 volatile int32_t uart_rx_timeout = SYS_FOREVER_US;
+
+// Dual-buffer instance for RX reception
+volatile dual_buf_t rx_buf;
 
 
 int my_uart_initialize(void){
@@ -51,22 +52,58 @@ void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data){
             
         break;
 
+        case UART_RX_BUF_REQUEST:
+            if(!rx_buf.a_busy){
+                uart_rx_buf_rsp(my_uart, rx_buf.a, sizeof(rx_buf.a));
+                rx_buf.a_busy = true;
+            }else if(!rx_buf.b_busy){
+                uart_rx_buf_rsp(my_uart, rx_buf.b, sizeof(rx_buf.b));
+                rx_buf.b_busy = true;
+            }else{
+                k_event_post(&app_evt, EVT_UART_NO_BUF);
+            }
+        break;
+
+        case UART_RX_BUF_RELEASED:
+            uint8_t *released_buf = evt->data.rx_buf.buf;
+            if(released_buf==rx_buf.a){
+                rx_buf.a_busy = false;
+            }else if(released_buf==rx_buf.b){
+                rx_buf.b_busy = false;
+            }
+        break;
+
         case UART_RX_RDY:
             size_t rcv_len = evt->data.rx.len;
             size_t rcv_offset = evt->data.rx.offset;
-            size_t total_rcv_len = rcv_len+rcv_offset;
-            if(total_rcv_len==sizeof(std_uart_packet_rx.frame)){
-                k_timer_stop(&uart_timeout);
-                // Notify reception of a standard packet
-                k_event_post(&app_evt, EVT_STD_PKT_RCVD);
-            }else if(rcv_offset==0){
-                k_timer_start(&uart_timeout, K_SECONDS(3), K_NO_WAIT);
+            size_t total_rcv_len = data_pkt.idx + rcv_len;
+            if(atomic_test_bit(&data_pkt_freeze, 0)){
+                k_event_post(&app_evt, EVT_UART_RX_BUSY_DROPPED);
+                break;
             }
-            
+            if(total_rcv_len<=data_pkt.data_len){
+                memcpy(&data_pkt.buf[data_pkt.idx], &evt->data.rx.buf[rcv_offset], rcv_len);
+                data_pkt.idx = total_rcv_len;
+                if(total_rcv_len==data_pkt.data_len){
+                    atomic_set_bit(&data_pkt_freeze,0);
+                    k_event_post(&app_evt, EVT_UART_PKT_RCVD);
+                }
+            }else{
+                k_event_post(&app_evt, EVT_DT_PKT_OVERFLOW);
+            }
+             
         break;
 
         case UART_RX_DISABLED:
-            //strcpy(debug_str, "UART Disabled");
+            if(!rx_buf.a_busy){
+                uart_rx_enable(my_uart, rx_buf.a, sizeof(rx_buf.a), 10000);
+                rx_buf.a_busy = true;
+            }else if(!rx_buf.b_busy){
+                uart_rx_enable(my_uart, rx_buf.b, sizeof(rx_buf.b), 10000);
+                rx_buf.b_busy = true;
+            }else{
+                k_event_post(&app_evt, EVT_UART_NO_BUF_DISABLED);
+            }
         break;
 
         case UART_RX_STOPPED:

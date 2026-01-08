@@ -112,7 +112,7 @@ typedef union{
 
 // Standard UART packet structure
 typedef union{
-    uint8_t frame[5];
+    uint8_t frame[5]__attribute__((packed));
     struct{
         uint8_t opcode;
         my_uint32_t payload;
@@ -121,7 +121,7 @@ typedef union{
 
 // Structure used for transmitting the eartag table
 typedef union{
-    uint8_t frame[(EARTAG_TABLE_SIZE*14)+16];
+    uint8_t frame[(EARTAG_TABLE_SIZE*14)+16]__attribute__((packed));
     struct{
         uint8_t opcode;
         my_uint32_t crc32;
@@ -129,13 +129,28 @@ typedef union{
         my_uint32_t base_timestamp;
         my_uint32_t base_step_counter;
         uint8_t delta_step_counter_len;
-        uint8_t delta_payload[EARTAG_TABLE_SIZE*14];
+        uint8_t delta_payload[EARTAG_TABLE_SIZE*14]__attribute__((packed));
     }__attribute__((packed)) field;
 }delta_frame_t;
 
+// Structure used to store all types of data packets
+typedef struct{
+    uint8_t buf[(EARTAG_TABLE_SIZE*14)+16]__attribute__((packed));
+    uint16_t data_len;
+    uint16_t idx;
+}generic_dat_pkt_t;
+
+// Generic buffer used to store both standard and delta packets
+extern volatile generic_dat_pkt_t data_pkt;
+
+// Standard TX UART packet instance
+extern volatile std_uart_pkt_type std_uart_packet_tx;
+
+// Structure used for transmitting the eartag table
+extern volatile delta_frame_t delta_table_packet;
+
 // Size of the table to be transmitted, in bytes
 extern volatile uint32_t delta_table_pkt_len;
-
 
 //UART opcodes
 #define TIME_SYNC_CMD 0x09
@@ -145,23 +160,19 @@ extern volatile uint32_t delta_table_pkt_len;
 #define NOK_RES 0x0D
 #define TABLE_RES 0x0E
 
-// Standard TX UART packet instance
-extern volatile std_uart_pkt_type std_uart_packet_tx;
-
-// Standard RX UART packet instance
-extern volatile std_uart_pkt_type std_uart_packet_rx;
-
-// Structure used for transmitting the eartag table
-extern volatile delta_frame_t delta_table_packet;
-
 
 // Bit positions of the events.
-#define EVT_TIME_SYNC       (1u << 0)
-#define EVT_OK_RCVD         (1u << 1)
-#define EVT_NOK_RCVD        (1u << 2)
-#define EVT_STD_PKT_RCVD    (1u << 3)
-#define EVT_DELTA_PKT_RCVD  (1u << 4)
-#define EVT_UART_TIMEOUT    (1u << 5)
+#define EVT_TIME_SYNC               (1u << 0)
+#define EVT_OK_RCVD                 (1u << 1)
+#define EVT_NOK_RCVD                (1u << 2)
+#define EVT_STD_PKT_RCVD            (1u << 3)
+#define EVT_DELTA_PKT_RCVD          (1u << 4)
+#define EVT_UART_TIMEOUT            (1u << 5)
+#define EVT_UART_PKT_RCVD           (1u << 6)
+#define EVT_DT_PKT_OVERFLOW         (1u << 7)
+#define EVT_UART_NO_BUF             (1u << 8)
+#define EVT_UART_NO_BUF_DISABLED    (1u << 9)
+#define EVT_UART_RX_BUSY_DROPPED    (1u << 10)
 
 // Event object used for inter-thread and ISR signaling
 extern struct k_event app_evt;
@@ -190,6 +201,9 @@ extern struct k_msgq eartag_msg_queue;
 
 // This flag prevents new entries from being added to the eartag table during critical operations
 extern volatile atomic_t table_freeze;
+
+// This flag prevents data from being added to data_pkt while it is being processed
+extern volatile atomic_t data_pkt_freeze;
 
 // Semaphore used by add_to_table() to notify that an entry has been removed from the table
 extern struct k_sem entry_removed_sem;
