@@ -29,8 +29,8 @@ int main(void)
 	}
 	printk("oi\r\n");
 
-	data_pkt.idx = 0;
-    data_pkt.data_len = (uint16_t)sizeof(std_uart_pkt_type);
+	cobs_pkt.idx = 0;
+    
 	
 	//Enable UART reception
 	uart_rx_enable(my_uart, rx_buf.a, sizeof(rx_buf.a), 10000);

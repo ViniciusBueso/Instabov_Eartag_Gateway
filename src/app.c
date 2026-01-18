@@ -45,11 +45,24 @@ volatile delta_frame_t delta_table_packet = {0};
 // Generic buffer used to store both standard and delta packets
 volatile generic_dat_pkt_t data_pkt = {0};
 
+// Pointer used to cast the generic packet to a standard packet
+const std_uart_pkt_type *std_pkt = (std_uart_pkt_type *)(void *)&data_pkt.buf[0];
+
+// UART RX/TX buffer for COBS-encoded packets.
+// The size accounts for the maximum eartag table payload plus COBS overhead and safety margin.
+volatile generic_dat_pkt_t cobs_pkt = {0};
+
 // Size of the table to be transmitted, in bytes
 volatile uint32_t delta_table_pkt_len = 0;
 
 // Event object used for inter-thread and ISR signaling
 K_EVENT_DEFINE(app_evt);
+
+// Global variable that stores the most recently reported error that has not yet been processed, along with its severity level
+volatile err_var_t err_var = {
+    .err_code = err_none,
+    .severity = 0,
+};
 
 // Semaphore that triggers the execution of cmd_res_handler()
 K_SEM_DEFINE(run_cmd_res_handler, 0, 1);
@@ -167,36 +180,6 @@ int add_to_table(eartag_type *ear_tag){
 
 }
 
-// Converts a hexadecimal string (upper case only!) to its corresponding numeric byte value
-void hexByteStr_to_hexByte(char *hexByteStr, uint8_t *hexByte){
-    uint8_t temp_var = 0;
-    if(hexByteStr[0]>64){
-        temp_var = hexByteStr[0] - 55;
-    }else{
-        temp_var = hexByteStr[0] - 48;
-    }
-
-    *hexByte = temp_var*16;
-
-    if(hexByteStr[1]>64){
-        temp_var = hexByteStr[1] - 55;
-    }else{
-        temp_var = hexByteStr[1] - 48;
-    }
-
-    *hexByte = *hexByte + temp_var;
-}
-
-
-// Converts a MAC address string (AA:BB:CC:DD:EE:FF) to a 6-byte hexadecimal array
-void macStr_to_macHex(char *mac_str, uint8_t *mac_hex){
-    for(uint8_t i=0; i<6; i++){
-        hexByteStr_to_hexByte(&mac_str[i*3], &mac_hex[i]);
-    }
-}
-
-
-
 // Checks whether the provided MAC address already exists in the eartag table.
 // Returns the corresponding index if found, or -1 if it does not exist.
 int exists_in_table(uint8_t *mac_hex){
@@ -227,8 +210,7 @@ void uart_timeout_cb(struct k_timer *timer_id){
 void procedure_timeout_cb(struct k_timer *timer_id){
     strcpy(debug_str, "Procedure timeout");
     atomic_set_bit(&data_pkt_freeze, 0);
-    data_pkt.idx = 0;
-    data_pkt.data_len = (uint16_t)sizeof(std_uart_pkt_type);
+    cobs_pkt.idx = 0;
     atomic_clear_bit(&data_pkt_freeze, 0);
     atomic_clear_bit(&table_freeze, 0);
     state = fetching_procedures;
@@ -248,8 +230,9 @@ void app_state_machine(void){
     int ret;
     procedures_t current_procedure = none;
     uint32_t rcvd_events = 0;
-    std_uart_pkt_type *std_pkt;
     uint8_t ok_opcode;
+    cobs_encode_result res_encode;
+    my_uint32_t std_payload;
 
     switch(state){
         case fetching_procedures:
@@ -260,11 +243,15 @@ void app_state_machine(void){
                     break;
 
                     case table_xfer_proc:
-                        state = table_xfer_prepare;
+                        state = table_xfer;
                     break;
 
                     case table_housekeeping_proc:
                         state = table_housekeeping_start;
+                    break;
+
+                    case error_proc:
+                        state = error_procedure;
                     break;
 
                     default:
@@ -274,35 +261,50 @@ void app_state_machine(void){
         break;
 
         case time_sync:
-            std_pkt = (std_uart_pkt_type *)(void *)&data_pkt.buf[0];
+            
             current_unix_time = std_pkt->field.payload.value;
-            data_pkt.idx = 0;
-            data_pkt.data_len = (uint16_t)sizeof(std_uart_pkt_type);
-            atomic_clear_bit(&data_pkt_freeze,0);
             struct timespec ts;
             ts.tv_sec = (time_t)current_unix_time;
             ts.tv_nsec = 0;
             ret = clock_settime(CLOCK_REALTIME, &ts);
 
             //Confirm reception
-            std_uart_packet_tx.field.opcode = OK_RES;
-            std_uart_packet_tx.field.payload.bytes.byte[0] = TIME_SYNC_CMD;
-            uart_tx(my_uart, std_uart_packet_tx.frame, sizeof(std_uart_packet_tx.frame), SYS_FOREVER_US);
-            k_timer_stop(&procedure_timeout);
-            state = fetching_procedures;         
+            std_payload.bytes.byte[0] = TIME_SYNC_CMD;
+            ret = send_cobs_uart_pkt(OK_RES, std_payload.bytes.byte, sizeof(std_uart_pkt_type));
+            if(ret==0){
+                state = time_sync_wait_tx;
+            }                    
         break;
 
-        case table_xfer_prepare:
+        case time_sync_wait_tx:
+            rcvd_events = k_event_wait_safe(&app_evt, 
+                                        EVT_TX_DONE|EVT_ERR,
+                                        false,
+                                        K_MSEC(50));
+            if(rcvd_events & EVT_ERR){
+                if(err_var.severity){
+                    atomic_clear_bit(&data_pkt_freeze,0);
+                    k_timer_stop(&procedure_timeout); 
+                    state = fetching_procedures;
+                    break;
+                }
+            } 
+            
+            if(rcvd_events & EVT_TX_DONE){
+                k_timer_stop(&procedure_timeout);
+                atomic_clear_bit(&data_pkt_freeze,0);
+                state = fetching_procedures; 
+            }
+
+        break;
+
+        case table_xfer:
 
             // Prevents new entries from being added to the eartag table during the table transfer procedure 
             atomic_set_bit(&table_freeze, 0);
 
-            // Process data and prepare receive buffer for the confirmation packet
-            std_pkt = (std_uart_pkt_type *)(void *)&data_pkt.buf[0];
-            data_pkt.idx = 0;
-            data_pkt.data_len = (uint16_t)sizeof(std_uart_pkt_type);
+            // Process data and prepare receive buffer for the confirmation packet     
             uint32_t rcvd_hash = std_pkt->field.payload.value;
-            atomic_clear_bit(&data_pkt_freeze,0);
 
             // Check whether the received hash matches the hash calculated from the previously transmitted table.
             // If they match, the LTE SiP and BLE SoC are synchronized and only changed fields are sent.
@@ -318,77 +320,69 @@ void app_state_machine(void){
             // Prepare and format the delta packet for transmission
             ret = format_delta_packet(&delta_table_packet, all_or_delta);
 
-            // Send the delta table length packet on success, or an NOK packet otherwise
+            // Send the delta table packet on success, or an NOK packet otherwise
             if(ret>0){
-                std_uart_packet_tx.field.opcode = TABLE_LEN_RES;
                 delta_table_pkt_len = (uint32_t)ret;
-                std_uart_packet_tx.field.payload.value = delta_table_pkt_len;
-                k_sleep(K_MSEC(200));
-                uart_tx(my_uart, std_uart_packet_tx.frame, sizeof(std_uart_packet_tx.frame), SYS_FOREVER_US);
-                state = table_xfer_send_table;
-                strcpy(debug_str, "Delta Pkt successfully generated");
+                ret = send_cobs_uart_pkt(TABLE_RES, NULL, delta_table_pkt_len);
+                if(ret==0){
+                    state = table_xfer_wait_tx;
+                }
             }else{
-                std_uart_packet_tx.field.opcode = NOK_RES;
-                std_uart_packet_tx.field.payload.bytes.byte[0] = TABLE_REQ_CMD;
-                k_sleep(K_MSEC(200));
-                uart_tx(my_uart, std_uart_packet_tx.frame, sizeof(std_uart_packet_tx.frame), SYS_FOREVER_US);
-                atomic_clear_bit(&table_freeze, 0);
-                state = fetching_procedures;
-                strcpy(debug_str, "Delta Pkt generation failed");
+                std_payload.bytes.byte[0] = TABLE_REQ_ERROR;
+                ret = send_cobs_uart_pkt(NOK_RES, std_payload.bytes.byte, sizeof(std_uart_pkt_type));
+                if(ret==0){
+                    delta_table_pkt_len = 0;
+                    state = table_xfer_wait_tx;
+                }
             }
             
         break;
 
-        case table_xfer_send_table:
-            // Wait for an OK/NOK packet. If OK, transmit the delta table packet and transition
-            // to the table_xfer_wait_ack state. If NOK, abort the procedure and wait for a new
-            // request from the host.
+        case table_xfer_wait_tx:
             rcvd_events = k_event_wait_safe(&app_evt, 
-                                        EVT_OK_RCVD|EVT_NOK_RCVD,
+                                        EVT_TX_DONE|EVT_ERR,
                                         false,
                                         K_MSEC(50));
-
-            if(rcvd_events & EVT_OK_RCVD){
-                std_pkt = (std_uart_pkt_type *)(void *)&data_pkt.buf[0];
-                data_pkt.idx = 0;
-                data_pkt.data_len = (uint16_t)sizeof(std_uart_pkt_type);
-                ok_opcode = std_pkt->field.payload.bytes.byte[0];
-                atomic_clear_bit(&data_pkt_freeze,0);
-
-                if(ok_opcode==TABLE_LEN_RES){
-                    strcpy(debug_str, "Sending table...");
-                    k_sleep(K_MSEC(200));
-                    uart_tx(my_uart, delta_table_packet.frame, delta_table_pkt_len, SYS_FOREVER_US);
-                    state = table_xfer_wait_ack;
-                }else{
-                    atomic_clear_bit(&table_freeze, 0);
-                    strcpy(debug_str, "Wrong OK opcode...");
+            if(rcvd_events & EVT_ERR){
+                if(err_var.severity){
+                    atomic_clear_bit(&data_pkt_freeze,0);
+                    k_timer_stop(&procedure_timeout); 
                     state = fetching_procedures;
+                    break;
                 }
-
-            }else if(rcvd_events & EVT_NOK_RCVD){
-                std_pkt = (std_uart_pkt_type *)(void *)&data_pkt.buf[0];
-                data_pkt.idx = 0;
-                data_pkt.data_len = (uint16_t)sizeof(std_uart_pkt_type);
-                atomic_clear_bit(&table_freeze, 0);
-                atomic_clear_bit(&data_pkt_freeze,0);
-                strcpy(debug_str, "NOK...");
-                state = fetching_procedures;
             }
-
+            
+            if(rcvd_events & EVT_TX_DONE){
+                atomic_clear_bit(&data_pkt_freeze,0);
+                if(delta_table_pkt_len==0){
+                    k_timer_stop(&procedure_timeout);
+                    state = fetching_procedures; 
+                }else{
+                    state = table_xfer_wait_ack;
+                }
+                
+            }
         break;
+
 
         case table_xfer_wait_ack:
             // Wait for an OK/NOK packet.
             rcvd_events = k_event_wait_safe(&app_evt, 
-                                        EVT_OK_RCVD|EVT_NOK_RCVD,
+                                        EVT_OK_RCVD|EVT_NOK_RCVD|EVT_ERR,
                                         false,
                                         K_MSEC(50));
+            
+            if(rcvd_events & EVT_ERR){
+                if(err_var.severity){
+                    atomic_clear_bit(&data_pkt_freeze,0);
+                    k_timer_stop(&procedure_timeout); 
+                    state = fetching_procedures;
+                    break;
+                }
+            }  
 
             if(rcvd_events & EVT_OK_RCVD){
-                std_pkt = (std_uart_pkt_type *)(void *)&data_pkt.buf[0];
-                data_pkt.idx = 0;
-                data_pkt.data_len = (uint16_t)sizeof(std_uart_pkt_type);
+                
                 ok_opcode = std_pkt->field.payload.bytes.byte[0];
                 atomic_clear_bit(&data_pkt_freeze,0);
                 if(ok_opcode==TABLE_RES){
@@ -404,14 +398,12 @@ void app_state_machine(void){
 
             }else if(rcvd_events & EVT_NOK_RCVD){
                 strcpy(debug_str, "Table TX failed");
-                std_pkt = (std_uart_pkt_type *)(void *)&data_pkt.buf[0];
-                data_pkt.idx = 0;
-                data_pkt.data_len = (uint16_t)sizeof(std_uart_pkt_type);
                 atomic_clear_bit(&data_pkt_freeze,0);
                 atomic_clear_bit(&table_freeze, 0);
                 k_timer_stop(&procedure_timeout);
                 state = fetching_procedures;
-            }    
+            }
+              
         break;
         
         case table_housekeeping_start:
@@ -445,6 +437,90 @@ void app_state_machine(void){
             state = fetching_procedures;
         break;
 
+        case error_procedure:
+            uint8_t error_code = err_var.err_code;
+            uint8_t error_severity = err_var.severity;
+            atomic_clear_bit(&table_freeze, 0);
+            k_timer_stop(&procedure_timeout);
+            err_var.err_code = err_none;
+            err_var.severity = 0;
+            k_event_clear(&app_evt, EVT_ERR);
+
+            switch(error_code){
+                case err_uart_no_buf:
+                    sprintf(debug_str, "UART no buf");
+                    state = fetching_procedures;
+                break;
+
+                case err_uart_disabled:
+                    atomic_set_bit(&data_pkt_freeze,0);
+                    cobs_pkt.idx = 0;
+                    k_sleep(K_MSEC(100));
+                    if(!rx_buf.a_busy){
+                        uart_rx_enable(my_uart, rx_buf.a, sizeof(rx_buf.a), 10000);
+                        rx_buf.a_busy = true;
+                    }else if(!rx_buf.b_busy){
+                        uart_rx_enable(my_uart, rx_buf.b, sizeof(rx_buf.b), 10000);
+                        rx_buf.b_busy = true;
+                    }else{
+                        uart_rx_enable(my_uart, rx_buf.a, sizeof(rx_buf.a), 10000);
+                        rx_buf.a_busy = true;
+                    }
+                    atomic_clear_bit(&data_pkt_freeze,0);
+                    state = fetching_procedures;
+                break;
+
+                case err_gap_violation:
+                    sprintf(debug_str, "pkt gap violation");
+                    state = fetching_procedures;   
+                break;
+
+                case err_pkt_overflow:
+                    atomic_set_bit(&data_pkt_freeze,0);
+                    cobs_pkt.idx = 0;
+                    std_payload.bytes.byte[0] = PKT_OVERFLOW_ERROR;
+                    ret = send_cobs_uart_pkt(NOK_RES, std_payload.bytes.byte, sizeof(std_uart_pkt_type));
+                    if(ret==0){
+                        state = error_procedure_wait_tx;
+                    }
+                    
+                break;
+
+                case err_uart_busy_dropped:
+                    sprintf(debug_str, "UART busy dropped");
+                    state = fetching_procedures;   
+                break;
+
+                case err_pkt_malformed:
+                    atomic_set_bit(&data_pkt_freeze,0);
+                    cobs_pkt.idx = 0;
+                    std_payload.bytes.byte[0] = PKT_MALFORMED_ERROR;
+                    ret = send_cobs_uart_pkt(NOK_RES, std_payload.bytes.byte, sizeof(std_uart_pkt_type));
+                    if(ret==0){
+                        state = error_procedure_wait_tx;
+                    }
+                break;
+
+                default:
+                    state = fetching_procedures;
+                break;
+            }
+        break;
+
+        case error_procedure_wait_tx:
+            rcvd_events = k_event_wait_safe(&app_evt, 
+                                        EVT_TX_DONE,
+                                        false,
+                                        K_MSEC(50));
+            
+            
+            if(rcvd_events & EVT_TX_DONE){
+                atomic_clear_bit(&data_pkt_freeze,0);
+                state = fetching_procedures;  
+            }
+
+        break;
+
     }
 }
 
@@ -465,79 +541,6 @@ K_THREAD_DEFINE(table_handler_tid, THREAD_STACK_SIZE,
                 THREAD_PRIORITY, 0, 0);
 
 
-
-
-// Main loop for handling commands and responses
-int cmd_res_handler(void *arg1, void *arg2, void *arg3){
-    int err;
-    uint32_t rcvd_events = 0;
-    uint8_t var_opcode = 0;
-    
-    while(1){
-        rcvd_events = k_event_wait_safe(&app_evt, 
-                            EVT_UART_PKT_RCVD|EVT_DT_PKT_OVERFLOW|EVT_UART_NO_BUF|EVT_UART_RX_BUSY_DROPPED|EVT_UART_NO_BUF_DISABLED,
-                            false,
-                            K_FOREVER);
-                                        
-
-        if(rcvd_events & EVT_UART_PKT_RCVD){
-            var_opcode = data_pkt.buf[0];
-            switch(var_opcode){
-                case TIME_SYNC_CMD:
-                    k_timer_start(&procedure_timeout, K_SECONDS(5), K_NO_WAIT);
-                    procedure_request = time_sync_proc;
-                    if (k_msgq_put(&procedure_queue, &procedure_request, K_NO_WAIT) != 0) {
-                        //drop newest packet
-                    }
-
-                    strcpy(debug_str, "Time Sync CMD rcvd");
-                break;
-
-                case TABLE_REQ_CMD:
-                    k_timer_start(&procedure_timeout, K_SECONDS(10), K_NO_WAIT);
-                    strcpy(debug_str, "Table Req CMD rcvd");
-                    procedure_request = table_xfer_proc;
-                    if (k_msgq_put(&procedure_queue, &procedure_request, K_NO_WAIT) != 0) {
-                        //drop newest packet
-                    }
-                break;
-
-                case OK_RES:
-                    strcpy(debug_str, "OK pkt rcvd");
-                    
-                    // Notify reception of the OK packet
-                    k_event_post(&app_evt, EVT_OK_RCVD);
-                break;
-
-                case NOK_RES:
-                    strcpy(debug_str, "NOK pkt rcvd");
-                    // Notify reception of the NOK packet
-                    k_event_post(&app_evt, EVT_NOK_RCVD);
-                break;
-            }
-        }
-
-        if(rcvd_events & EVT_UART_NO_BUF){
-            strcpy(debug_str, "BUF request failed.");
-        }
-
-        if(rcvd_events & EVT_UART_NO_BUF_DISABLED){
-            strcpy(debug_str, "UART Disabled");
-        }
-
-        if(rcvd_events & EVT_DT_PKT_OVERFLOW){
-            strcpy(debug_str, "Packed Data Overflow");
-        }
-
-        if(rcvd_events & EVT_UART_RX_BUSY_DROPPED){
-            strcpy(debug_str, "Data dropped");
-        }
-    }
-}
-
-K_THREAD_DEFINE(cmd_res_handler_tid, THREAD_STACK_SIZE,
-				cmd_res_handler, NULL, NULL, NULL,
-                THREAD_PRIORITY, 0, 0);
 
 // Compare the current eartag table with the last transmitted one and format the provided delta frame accordingly
 // If send_all is set, all fields are transmitted; otherwise, only fields that changed since the last transmission are included
@@ -693,6 +696,94 @@ int format_delta_packet(delta_frame_t *df, bool send_all){
     df->field.crc32.value = crc32_ieee(&df->frame[5], delta_frame_len-5);
 
     return delta_frame_len;
+}
+
+
+// Used to notify the main application of the occurrence of one or more errors.
+// It sets the error code and pushes the error_procedure to the procedure_queue.
+// Depending on the error severity, all pending procedures are flushed before
+// inserting the error procedure.
+int post_error(err_codes_t error_code){
+    uint8_t error_severity = 0;
+    int ret = 0;
+    switch(error_code){
+        case err_uart_no_buf:
+            error_severity = 0;
+        break;
+
+        case err_uart_disabled:
+            error_severity = 1;
+        break;
+
+        case err_gap_violation:
+            error_severity = 0;
+        break;
+
+        case err_pkt_overflow:
+            error_severity = 1;
+        break;
+
+        case err_uart_busy_dropped:
+            error_severity = 0;
+        break;
+
+        case err_pkt_malformed:
+            error_severity = 1;
+        break;
+
+        default:
+
+        break;
+    }
+    if((err_var.err_code==err_none)|(err_var.severity<error_severity)){
+        err_var.err_code = error_code;
+        err_var.severity = error_severity;
+        if(err_var.severity){
+            k_msgq_purge(&procedure_queue);
+        }
+        k_event_post(&app_evt, EVT_ERR);
+        procedure_request = error_proc;
+        ret = k_msgq_put(&procedure_queue, &procedure_request, K_NO_WAIT);  
+    }
+         
+    return ret;
+}
+
+// Helper function that formats a TX packet, encodes it using the COBS protocol,
+// appends a delimiter, and sends it through the UART
+// Returns 0 on success; negative values indicate an error
+int send_cobs_uart_pkt(uint8_t opcode, uint8_t *payload, size_t pkt_len){
+    cobs_encode_result res_encode;
+
+    if(opcode==TABLE_RES){
+        // delta_table_packet is already initialized externally by the format_delta_table() function
+        res_encode = cobs_encode(cobs_pkt.buf, sizeof(cobs_pkt.buf), delta_table_packet.frame, pkt_len);
+        if(res_encode.status == COBS_ENCODE_OK){
+            cobs_pkt.buf[res_encode.out_len] = 0x00;
+            uart_tx(my_uart, cobs_pkt.buf, res_encode.out_len + 1, SYS_FOREVER_US);
+            return 0;
+        }else if(res_encode.status == COBS_ENCODE_NULL_POINTER){
+            return -2;
+        }else if(res_encode.status == COBS_ENCODE_OUT_BUFFER_OVERFLOW){
+            return -3;
+        }
+    }else{
+        if(pkt_len!=sizeof(std_uart_packet_tx.frame)){
+            return -1;
+        }
+        std_uart_packet_tx.field.opcode = opcode;
+        memcpy(std_uart_packet_tx.field.payload.bytes.byte, payload, pkt_len-1);
+        res_encode = cobs_encode(cobs_pkt.buf, sizeof(cobs_pkt.buf), std_uart_packet_tx.frame, pkt_len);
+        if(res_encode.status == COBS_ENCODE_OK){
+            cobs_pkt.buf[res_encode.out_len] = 0x00;
+            uart_tx(my_uart, cobs_pkt.buf, res_encode.out_len + 1, SYS_FOREVER_US);
+            return 0;
+        }else if(res_encode.status == COBS_ENCODE_NULL_POINTER){
+            return -2;
+        }else if(res_encode.status == COBS_ENCODE_OUT_BUFFER_OVERFLOW){
+            return -3;
+        }
+    }
 }
 
 // Function responsible for printing the current table to the terminal

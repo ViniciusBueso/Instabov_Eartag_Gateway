@@ -10,6 +10,9 @@
 #include <zephyr/sys/crc.h>
 #include "app_config.h"
 #include <zephyr/sys/hash_function.h>
+#include "libs/cobs.h"
+
+
 
 //Debug GUI
 #define ERASE_DISPLAY printk("\033[H\033[0J")
@@ -31,10 +34,13 @@ extern volatile bool just_once_debug;
 typedef enum{
     fetching_procedures,
     time_sync,
-    table_xfer_prepare,
-    table_xfer_send_table,
+    time_sync_wait_tx,
+    table_xfer,
+    table_xfer_wait_tx,
     table_xfer_wait_ack,
     table_housekeeping_start,
+    error_procedure,
+    error_procedure_wait_tx,
 }states_type;
 
 extern volatile states_type state;
@@ -48,6 +54,7 @@ typedef enum{
     time_sync_proc,
     table_xfer_proc,
     table_housekeeping_proc,
+    error_proc,
 } procedures_t;
 
 // Variable used to post procedure requests
@@ -119,7 +126,7 @@ typedef union{
     }__attribute__((packed)) field;
 }std_uart_pkt_type;
 
-// Structure used for transmitting the eartag table
+// Structure used for transmitting the eartag table 
 typedef union{
     uint8_t frame[(EARTAG_TABLE_SIZE*14)+16]__attribute__((packed));
     struct{
@@ -133,15 +140,21 @@ typedef union{
     }__attribute__((packed)) field;
 }delta_frame_t;
 
-// Structure used to store all types of data packets
+// Structure used to store all types of data packets (some overhead is added for COBS enconding)
 typedef struct{
-    uint8_t buf[(EARTAG_TABLE_SIZE*14)+16]__attribute__((packed));
-    uint16_t data_len;
+    uint8_t buf[(EARTAG_TABLE_SIZE*14)+16+1000]__attribute__((packed));
     uint16_t idx;
 }generic_dat_pkt_t;
 
 // Generic buffer used to store both standard and delta packets
 extern volatile generic_dat_pkt_t data_pkt;
+
+// Pointer used to cast the generic packet to a standard packet
+extern const std_uart_pkt_type *std_pkt;
+
+// UART RX/TX buffer for COBS-encoded packets.
+// The size accounts for the maximum eartag table payload plus COBS overhead and safety margin.
+extern volatile generic_dat_pkt_t cobs_pkt;
 
 // Standard TX UART packet instance
 extern volatile std_uart_pkt_type std_uart_packet_tx;
@@ -160,22 +173,53 @@ extern volatile uint32_t delta_table_pkt_len;
 #define NOK_RES 0x0D
 #define TABLE_RES 0x0E
 
+//NOK reason codes
+#define TABLE_REQ_ERROR 0x0F
+#define TIME_SYNC_ERROR 0x10
+#define PKT_MALFORMED_ERROR 0x11
+#define PKT_OVERFLOW_ERROR 0x12
+
 
 // Bit positions of the events.
-#define EVT_TIME_SYNC               (1u << 0)
-#define EVT_OK_RCVD                 (1u << 1)
-#define EVT_NOK_RCVD                (1u << 2)
-#define EVT_STD_PKT_RCVD            (1u << 3)
-#define EVT_DELTA_PKT_RCVD          (1u << 4)
-#define EVT_UART_TIMEOUT            (1u << 5)
-#define EVT_UART_PKT_RCVD           (1u << 6)
-#define EVT_DT_PKT_OVERFLOW         (1u << 7)
-#define EVT_UART_NO_BUF             (1u << 8)
-#define EVT_UART_NO_BUF_DISABLED    (1u << 9)
-#define EVT_UART_RX_BUSY_DROPPED    (1u << 10)
+#define EVT_TIME_SYNC                   (1u << 0)
+#define EVT_OK_RCVD                     (1u << 1)
+#define EVT_NOK_RCVD                    (1u << 2)
+#define EVT_STD_PKT_RCVD                (1u << 3)
+#define EVT_DELTA_PKT_RCVD              (1u << 4)
+#define EVT_UART_TIMEOUT                (1u << 5)
+#define EVT_UART_PKT_RCVD               (1u << 6)
+#define EVT_UART_PKT_OVERFLOW           (1u << 7)
+#define EVT_UART_NO_BUF                 (1u << 8)
+#define EVT_UART_NO_BUF_DISABLED        (1u << 9)
+#define EVT_UART_RX_BUSY_DROPPED        (1u << 10)
+#define EVT_UART_FRAME_GAP_VIOLATION    (1u << 10)
+#define EVT_APP_RCVD_PKT_ERR            (1u << 11)
+#define EVT_APP_UART_ERR                (1u << 12)
+#define EVT_ERR                         (1u << 13)
+#define EVT_TX_DONE                     (1u << 14)
 
 // Event object used for inter-thread and ISR signaling
 extern struct k_event app_evt;
+
+// Enumeration defining the possible error causes reported by the system
+typedef enum{
+    err_none,
+    err_uart_no_buf,
+    err_uart_disabled,
+    err_gap_violation,
+    err_pkt_overflow,
+    err_uart_busy_dropped,
+    err_pkt_malformed
+}err_codes_t;
+
+// Structure holding the current error status and its severity level
+typedef struct{
+    err_codes_t err_code;
+    uint8_t severity;
+}err_var_t;
+
+// Global variable that stores the most recently reported error that has not yet been processed, along with its severity level
+extern volatile err_var_t err_var;
 
 // Semaphore that triggers the execution of cmd_res_handler()
 extern struct k_sem run_cmd_res_handler;
@@ -226,12 +270,6 @@ void table_housekeeping_cb(struct k_timer *timer_id);
 // Adds an entry to the eartag table, or updates it if the same ID already exists
 int add_to_table(eartag_type *ear_tag);
 
-// Converts a hexadecimal string to its corresponding numeric byte value
-void hexByteStr_to_hexByte(char *hexByteStr, uint8_t *hexByte);
-
-// Converts a MAC address string (AA:BB:CC:DD:EE:FF) to a 6-byte hexadecimal array
-void macStr_to_macHex(char *mac_str, uint8_t *mac_hex);
-
 // Checks whether the provided MAC address already exists in the eartag table.
 // Returns the corresponding index if found, or -1 if it does not exist.
 int exists_in_table(uint8_t *mac_hex);
@@ -240,6 +278,17 @@ int exists_in_table(uint8_t *mac_hex);
 // If send_all is set, all fields are transmitted; otherwise, only fields that changed since the last transmission are included
 // Returns 0 on success, or -1 on failure
 int format_delta_packet(delta_frame_t *df, bool send_all);
+
+// Used to notify the main application of the occurrence of one or more errors.
+// It sets the error code and pushes the error_procedure to the procedure_queue.
+// Depending on the error severity, all pending procedures are flushed before
+// inserting the error procedure.
+int post_error(err_codes_t error_code);
+
+// Helper function that formats a TX packet, encodes it using the COBS protocol,
+// appends a delimiter, and sends it through the UART
+// Returns 0 on success; negative values indicate an error
+int send_cobs_uart_pkt(uint8_t opcode, uint8_t *payload, size_t pkt_len);
 
 // Application state machine
 void app_state_machine(void);
@@ -250,4 +299,5 @@ void debug_print_table(void);
 // Formats a number into a string of fixed length (char_size), centering the number
 // and padding the remaining characters as needed.
 int debug_centralize_str_num(char *out_str, uint32_t number, uint8_t char_size);
+
 #endif

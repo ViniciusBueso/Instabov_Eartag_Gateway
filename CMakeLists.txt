@@ -9,4 +9,5 @@ target_sources(app PRIVATE
         src/peripherals/my_gpio.c
         src/peripherals/my_uart.c
         src/app.c
+        src/libs/cobs.c
 )
